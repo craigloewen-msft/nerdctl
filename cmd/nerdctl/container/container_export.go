@@ -16,7 +16,7 @@ import (
 func ExportCommand() *cobra.Command {
 	var exportCommand = &cobra.Command{
 		Use:               "export [OPTIONS] CONTAINER",
-		Args:              cobra.MinimumNArgs(1),
+		Args:              cobra.ExactArgs(1),
 		Short:             "Export a containers filesystem as a tar archive",
 		Long:              "Export a containers filesystem as a tar archive",
 		RunE:              exportAction,
