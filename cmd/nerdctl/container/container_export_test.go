@@ -17,6 +17,8 @@
 package container
 
 import (
+	"archive/tar"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,19 +31,36 @@ import (
 	"github.com/containerd/nerdctl/v2/pkg/testutil/nerdtest"
 )
 
-// validateExportedTar checks that the tar file exists and has content
+// validateExportedTar checks that the tar file exists and contains /bin/busybox
 func validateExportedTar(outFile string) test.Comparator {
 	return func(stdout string, t tig.T) {
 		// Check if the tar file was created
 		_, err := os.Stat(outFile)
 		assert.Assert(t, !os.IsNotExist(err), "exported tar file %s was not created", outFile)
 
-		// Check if the tar file has some content (not empty)
-		statInfo, err := os.Stat(outFile)
-		assert.NilError(t, err, "failed to stat tar file %s", outFile)
-		assert.Assert(t, statInfo.Size() > 0, "exported tar file %s is empty", outFile)
+		// Open and read the tar file to check for /bin/busybox
+		file, err := os.Open(outFile)
+		assert.NilError(t, err, "failed to open tar file %s", outFile)
+		defer file.Close()
 
-		t.Log("Export validation passed: tar file exists and has content")
+		tarReader := tar.NewReader(file)
+		busyboxFound := false
+
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			assert.NilError(t, err, "failed to read tar entry")
+
+			if header.Name == "bin/busybox" || header.Name == "./bin/busybox" {
+				busyboxFound = true
+				break
+			}
+		}
+
+		assert.Assert(t, busyboxFound, "exported tar file %s does not contain /bin/busybox", outFile)
+		t.Log("Export validation passed: tar file exists and contains /bin/busybox")
 	}
 }
 
