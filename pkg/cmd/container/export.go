@@ -19,17 +19,17 @@ package container
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/log"
 
 	"github.com/containerd/nerdctl/v2/pkg/api/types"
 	"github.com/containerd/nerdctl/v2/pkg/containerutil"
 	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
-	"github.com/containerd/nerdctl/v2/pkg/tarutil"
 )
 
 // Export exports a container's filesystem as a tar archive
@@ -109,54 +109,56 @@ func getContainerRoot(ctx context.Context, container containerd.Container) (stri
 }
 
 func createTarArchive(ctx context.Context, rootPath string, pid int, options types.ContainerExportOptions) error {
-	tarBinary, isGNUTar, tar_err := tarutil.FindTarBinary()
-	if tar_err != nil {
-		return tar_err
-	}
-	log.G(ctx).Debugf("Detected tar binary %q (GNU=%v)", tarBinary, isGNUTar)
-
-	// For now, use direct tar access. nsenter may have permission issues in rootless mode.
-	tarArgs := []string{"-c", "-f", "-", "-C", rootPath, "."}
-	cmd := exec.CommandContext(ctx, tarBinary, tarArgs...)
-
-	log.G(ctx).Debugf("Using tar directly: %s %v", cmd.Path, cmd.Args)
-
-	cmd.Stdout = options.Stdout
-
-	// For running containers (pid > 0), suppress stderr entirely as virtual filesystem
-	// errors are expected and not useful to the user. For stopped containers, show stderr
-	// as those errors might be legitimate issues.
-	if pid > 0 {
-		// Running container - suppress all stderr by redirecting to /dev/null
-		devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-		if err != nil {
-			return fmt.Errorf("failed to open /dev/null: %w", err)
-		}
-		defer devNull.Close()
-		cmd.Stderr = devNull
-		log.G(ctx).Debugf("Suppressing stderr for running container export (virtual filesystem errors expected)")
-	} else {
-		// Stopped container - show stderr as normal
-		cmd.Stderr = os.Stderr
-	}
-
-	err := cmd.Run()
-
-	// When exporting running containers, tar may fail with exit code 2 due to
-	// permission issues with virtual filesystems like /proc and /sys.
-	// This is expected behavior and should not cause the export to fail.
+	// Create a temporary empty directory to use as the "before" state for WriteDiff
+	emptyDir, err := os.MkdirTemp("", "nerdctl-export-empty-")
 	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			// Exit code 2 typically indicates "fatal error" but in the context
-			// of exporting containers, it's often due to permission denied errors
-			// on virtual filesystems which are expected and acceptable.
-			if exitError.ExitCode() == 2 && pid > 0 {
-				log.G(ctx).Debugf("tar exited with code 2, likely due to permission issues with virtual filesystems (expected for running containers)")
-				return nil
+		return fmt.Errorf("failed to create temporary empty directory: %w", err)
+	}
+	defer os.RemoveAll(emptyDir)
+
+	// Debug logging
+	log.G(ctx).Debugf("Using WriteDiff to export container filesystem from %s", rootPath)
+	log.G(ctx).Debugf("Empty directory: %s", emptyDir)
+	log.G(ctx).Debugf("Output writer type: %T", options.Stdout)
+
+	// Check if the rootPath directory exists and has contents
+	if entries, err := os.ReadDir(rootPath); err != nil {
+		log.G(ctx).Debugf("Failed to read rootPath directory %s: %v", rootPath, err)
+	} else {
+		log.G(ctx).Debugf("RootPath %s contains %d entries", rootPath, len(entries))
+		for i, entry := range entries {
+			if i < 10 { // Only log first 10 entries to avoid spam
+				log.G(ctx).Debugf("  - %s (dir: %v)", entry.Name(), entry.IsDir())
 			}
 		}
-		return err
+		if len(entries) > 10 {
+			log.G(ctx).Debugf("  ... and %d more entries", len(entries)-10)
+		}
 	}
 
+	// Create a counting writer to track bytes written
+	cw := &countingWriter{w: options.Stdout}
+
+	// Use WriteDiff to create a tar stream comparing the container rootfs (rootPath)
+	// with an empty directory (emptyDir). This produces a complete export of the container.
+	err = archive.WriteDiff(ctx, cw, rootPath, emptyDir)
+	if err != nil {
+		return fmt.Errorf("failed to write tar diff: %w", err)
+	}
+
+	log.G(ctx).Debugf("WriteDiff completed successfully, wrote %d bytes", cw.count)
+
 	return nil
+}
+
+// countingWriter wraps an io.Writer and counts the bytes written
+type countingWriter struct {
+	w     io.Writer
+	count int64
+}
+
+func (cw *countingWriter) Write(p []byte) (n int, err error) {
+	n, err = cw.w.Write(p)
+	cw.count += int64(n)
+	return n, err
 }
