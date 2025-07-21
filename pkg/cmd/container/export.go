@@ -109,9 +109,9 @@ func getContainerRoot(ctx context.Context, container containerd.Container) (stri
 }
 
 func createTarArchive(ctx context.Context, rootPath string, pid int, options types.ContainerExportOptions) error {
-	tarBinary, isGNUTar, tar_err := tarutil.FindTarBinary()
-	if tar_err != nil {
-		return tar_err
+	tarBinary, isGNUTar, tarErr := tarutil.FindTarBinary()
+	if tarErr != nil {
+		return tarErr
 	}
 	log.G(ctx).Debugf("Detected tar binary %q (GNU=%v)", tarBinary, isGNUTar)
 
