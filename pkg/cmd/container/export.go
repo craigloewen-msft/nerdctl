@@ -24,10 +24,10 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/log"
 
 	"github.com/containerd/nerdctl/v2/pkg/api/types"
-	"github.com/containerd/nerdctl/v2/pkg/containerutil"
 	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 	"github.com/containerd/nerdctl/v2/pkg/tarutil"
 )
@@ -66,7 +66,7 @@ func exportContainer(ctx context.Context, client *containerd.Client, container c
 			return fmt.Errorf("failed to get container info: %w", err)
 		}
 
-		root, cleanup, err = containerutil.MountSnapshotForContainer(ctx, client, conInfo, options.GOptions.Snapshotter)
+		root, cleanup, err = MountSnapshotForContainer(ctx, client, conInfo, options.GOptions.Snapshotter)
 		if cleanup != nil {
 			defer func() {
 				if cleanupErr := cleanup(); cleanupErr != nil {
@@ -159,4 +159,33 @@ func createTarArchive(ctx context.Context, rootPath string, pid int, options typ
 	}
 
 	return nil
+}
+
+// MountSnapshotForContainer mounts a container's snapshot and returns the mount path and cleanup function
+func MountSnapshotForContainer(ctx context.Context, client *containerd.Client, conInfo containers.Container, snapshotter string) (string, func() error, error) {
+	snapKey := conInfo.SnapshotKey
+	resp, err := client.SnapshotService(snapshotter).Mounts(ctx, snapKey)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tempDir, err := os.MkdirTemp("", "nerdctl-export-")
+	if err != nil {
+		return "", nil, err
+	}
+
+	err = mount.All(resp, tempDir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	cleanup := func() error {
+		err = mount.Unmount(tempDir, 0)
+		if err != nil {
+			return err
+		}
+		return os.RemoveAll(tempDir)
+	}
+
+	return tempDir, cleanup, nil
 }
