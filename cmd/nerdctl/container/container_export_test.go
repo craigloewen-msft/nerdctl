@@ -23,11 +23,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"gotest.tools/v3/assert"
+
 	"github.com/containerd/nerdctl/mod/tigron/test"
 	"github.com/containerd/nerdctl/mod/tigron/tig"
+
 	"github.com/containerd/nerdctl/v2/pkg/testutil"
 	"github.com/containerd/nerdctl/v2/pkg/testutil/nerdtest"
-	"gotest.tools/v3/assert"
 )
 
 // validateExportedTar checks that the tar file exists and contains /bin/busybox

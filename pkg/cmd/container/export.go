@@ -19,11 +19,9 @@ package container
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 
 	containerd "github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/log"
@@ -54,61 +52,45 @@ func Export(ctx context.Context, client *containerd.Client, containerReq string,
 }
 
 func exportContainer(ctx context.Context, client *containerd.Client, container containerd.Container, options types.ContainerExportOptions) error {
-	// Try to get a running container root first
-	root, pid, err := getContainerRoot(ctx, container)
-	var cleanup func() error
-
+	// Get container info to access the snapshot
+	conInfo, err := container.Info(ctx)
 	if err != nil {
-		// Container is not running, try to mount the snapshot
-		var conInfo containers.Container
-		conInfo, err = container.Info(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get container info: %w", err)
-		}
-
-		root, cleanup, err = MountSnapshotForContainer(ctx, client, conInfo, options.GOptions.Snapshotter)
-		if cleanup != nil {
-			defer func() {
-				if cleanupErr := cleanup(); cleanupErr != nil {
-					log.G(ctx).WithError(cleanupErr).Warn("Failed to cleanup mounted snapshot")
-				}
-			}()
-		}
-
-		if err != nil {
-			return fmt.Errorf("failed to mount container snapshot: %w", err)
-		}
-		log.G(ctx).Debugf("Mounted snapshot at %s", root)
-		// For stopped containers, set pid to 0 to avoid nsenter
-		pid = 0
-	} else {
-		log.G(ctx).Debugf("Using running container root %s (pid %d)", root, pid)
+		return fmt.Errorf("failed to get container info: %w", err)
 	}
 
-	// Create tar command to export the rootfs
-	return createTarArchive(ctx, root, pid, options)
+	// Use the container's snapshot service to get mounts
+	// This works for both running and stopped containers
+	sn := client.SnapshotService(conInfo.Snapshotter)
+	mounts, err := sn.Mounts(ctx, container.ID())
+	if err != nil {
+		return fmt.Errorf("failed to get container mounts: %w", err)
+	}
+
+	// Create a temporary directory to mount the snapshot
+	tempDir, err := os.MkdirTemp("", "nerdctl-export-")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary mount directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Mount the container's filesystem
+	err = mount.All(mounts, tempDir)
+	if err != nil {
+		return fmt.Errorf("failed to mount container snapshot: %w", err)
+	}
+	defer func() {
+		if unmountErr := mount.Unmount(tempDir, 0); unmountErr != nil {
+			log.G(ctx).WithError(unmountErr).Warn("Failed to unmount snapshot")
+		}
+	}()
+
+	log.G(ctx).Debugf("Mounted container snapshot at %s", tempDir)
+
+	// Create tar archive using WriteDiff
+	return createTarArchiveWithWriteDiff(ctx, tempDir, options)
 }
 
-func getContainerRoot(ctx context.Context, container containerd.Container) (string, int, error) {
-	task, err := container.Task(ctx, nil)
-	if err != nil {
-		return "", 0, err
-	}
-
-	status, err := task.Status(ctx)
-	if err != nil {
-		return "", 0, err
-	}
-
-	if status.Status != containerd.Running {
-		return "", 0, fmt.Errorf("container is not running")
-	}
-
-	pid := int(task.Pid())
-	return fmt.Sprintf("/proc/%d/root", pid), pid, nil
-}
-
-func createTarArchive(ctx context.Context, rootPath string, pid int, options types.ContainerExportOptions) error {
+func createTarArchiveWithWriteDiff(ctx context.Context, rootPath string, options types.ContainerExportOptions) error {
 	// Create a temporary empty directory to use as the "before" state for WriteDiff
 	emptyDir, err := os.MkdirTemp("", "nerdctl-export-empty-")
 	if err != nil {
@@ -136,57 +118,29 @@ func createTarArchive(ctx context.Context, rootPath string, pid int, options typ
 		}
 	}
 
-	// Create a counting writer to track bytes written
-	cw := &countingWriter{w: options.Stdout}
+	// Double check that emptyDir is empty
+	if entries, err := os.ReadDir(emptyDir); err != nil {
+		log.G(ctx).Debugf("Failed to read emptyDir directory %s: %v", emptyDir, err)
+	} else {
+		log.G(ctx).Debugf("EmptyDir %s contains %d entries", emptyDir, len(entries))
+		for i, entry := range entries {
+			if i < 10 { // Only log first 10 entries to avoid spam
+				log.G(ctx).Debugf("  - %s (dir: %v)", entry.Name(), entry.IsDir())
+			}
+		}
+		if len(entries) > 10 {
+			log.G(ctx).Debugf("  ... and %d more entries", len(entries)-10)
+		}
+	}
 
 	// Use WriteDiff to create a tar stream comparing the container rootfs (rootPath)
 	// with an empty directory (emptyDir). This produces a complete export of the container.
-	err = archive.WriteDiff(ctx, cw, rootPath, emptyDir)
+	err = archive.WriteDiff(ctx, options.Stdout, emptyDir, rootPath)
 	if err != nil {
 		return fmt.Errorf("failed to write tar diff: %w", err)
 	}
 
-	log.G(ctx).Debugf("WriteDiff completed successfully, wrote %d bytes", cw.count)
+	log.G(ctx).Debugf("WriteDiff completed successfully")
 
 	return nil
-}
-
-// countingWriter wraps an io.Writer and counts the bytes written
-type countingWriter struct {
-	w     io.Writer
-	count int64
-}
-
-func (cw *countingWriter) Write(p []byte) (n int, err error) {
-	n, err = cw.w.Write(p)
-	cw.count += int64(n)
-	return n, err
-}
-
-func MountSnapshotForContainer(ctx context.Context, client *containerd.Client, conInfo containers.Container, snapshotter string) (string, func() error, error) {
-	snapKey := conInfo.SnapshotKey
-	resp, err := client.SnapshotService(snapshotter).Mounts(ctx, snapKey)
-	if err != nil {
-		return "", nil, err
-	}
-
-	tempDir, err := os.MkdirTemp("", "nerdctl-cp-")
-	if err != nil {
-		return "", nil, err
-	}
-
-	err = mount.All(resp, tempDir)
-	if err != nil {
-		return "", nil, err
-	}
-
-	cleanup := func() error {
-		err = mount.Unmount(tempDir, 0)
-		if err != nil {
-			return err
-		}
-		return os.RemoveAll(tempDir)
-	}
-
-	return tempDir, cleanup, nil
 }
