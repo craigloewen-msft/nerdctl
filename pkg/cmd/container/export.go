@@ -24,11 +24,11 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/log"
 
 	"github.com/containerd/nerdctl/v2/pkg/api/types"
-	"github.com/containerd/nerdctl/v2/pkg/containerutil"
 	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
@@ -66,7 +66,7 @@ func exportContainer(ctx context.Context, client *containerd.Client, container c
 			return fmt.Errorf("failed to get container info: %w", err)
 		}
 
-		root, cleanup, err = containerutil.MountSnapshotForContainer(ctx, client, conInfo, options.GOptions.Snapshotter)
+		root, cleanup, err = MountSnapshotForContainer(ctx, client, conInfo, options.GOptions.Snapshotter)
 		if cleanup != nil {
 			defer func() {
 				if cleanupErr := cleanup(); cleanupErr != nil {
@@ -161,4 +161,32 @@ func (cw *countingWriter) Write(p []byte) (n int, err error) {
 	n, err = cw.w.Write(p)
 	cw.count += int64(n)
 	return n, err
+}
+
+func MountSnapshotForContainer(ctx context.Context, client *containerd.Client, conInfo containers.Container, snapshotter string) (string, func() error, error) {
+	snapKey := conInfo.SnapshotKey
+	resp, err := client.SnapshotService(snapshotter).Mounts(ctx, snapKey)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tempDir, err := os.MkdirTemp("", "nerdctl-cp-")
+	if err != nil {
+		return "", nil, err
+	}
+
+	err = mount.All(resp, tempDir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	cleanup := func() error {
+		err = mount.Unmount(tempDir, 0)
+		if err != nil {
+			return err
+		}
+		return os.RemoveAll(tempDir)
+	}
+
+	return tempDir, cleanup, nil
 }
